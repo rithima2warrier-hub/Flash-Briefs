@@ -1,4 +1,5 @@
 import os
+import time
 import feedparser
 import google.generativeai as genai
 from datetime import datetime, timezone
@@ -103,6 +104,7 @@ def main():
         headlines = fetch_news(company)
         summary = summarize(company, headlines)
         briefings.append((company, summary, headlines))
+        time.sleep(6)
     html = build_html(briefings)
     with open("index.html", "w", encoding="utf-8") as f:
         f.write(html)
