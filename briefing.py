@@ -1,9 +1,8 @@
 import os
 import time
 from google import genai
-import feedparser
+import requests
 from datetime import datetime, timezone
-from urllib.parse import quote
 
 # --- Config ---
 COMPANIES = [
@@ -17,85 +16,126 @@ TABS = [
         "id": "products",
         "label": "Products",
         "icon": "🚀",
-        "query_suffix": "product launch OR new feature OR release OR update",
-        "prompt": "Summarize in 2-3 short sentences what new products, features, or releases {company} announced in the last 24 hours. Focus only on actual launches and product updates. If nothing notable, say 'No major product launches today.' Be factual — only summarize what's in the headlines."
+        "query_suffix": "product launch new feature release update",
+        "prompt": "Summarize in 2-3 short sentences what new products, features, or releases {company} announced. Focus only on actual launches and product updates. If nothing notable, say 'No major product launches today.' Be factual."
     },
     {
         "id": "newsroom",
         "label": "Newsroom",
         "icon": "📣",
-        "query_suffix": "announcement OR partnership OR acquisition OR earnings",
-        "prompt": "Summarize in 2-3 short sentences the key company news for {company} from the last 24 hours — partnerships, acquisitions, leadership changes, earnings, major announcements. End with one short sentence on why this matters. If nothing notable, say 'No major company news today.'"
+        "query_suffix": "announcement partnership acquisition earnings",
+        "prompt": "Summarize in 2-3 short sentences the key company news for {company} — partnerships, acquisitions, leadership changes, earnings, major announcements. End with one short sentence on why this matters. If nothing notable, say 'No major company news today.'"
     },
     {
         "id": "analysis",
         "label": "Analysis & POV",
         "icon": "💡",
-        "query_suffix": "analysis OR opinion OR review OR commentary",
-        "prompt": "Summarize in 2-3 short sentences the key expert takes, analyst opinions, or notable points of view on {company}'s recent products and announcements from the last few days. Focus on what experts and journalists are saying — not just what {company} is saying about itself. If nothing notable, say 'No major analysis or expert commentary today.'"
+        "query_suffix": "analysis opinion review commentary",
+        "prompt": "Summarize in 2-3 short sentences the key expert takes, analyst opinions, or notable points of view on {company}'s recent products and announcements. Focus on what experts and journalists are saying — not just what {company} is saying about itself. If nothing notable, say 'No major analysis or expert commentary today.'"
     }
 ]
 
-# --- Setup Gemini using the new google-genai library ---
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-MODEL_NAME = "gemini-2.5-flash"
+# --- Setup APIs ---
+genai_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+TAVILY_API_KEY = os.environ["TAVILY_API_KEY"]
+GEMINI_MODEL = "gemini-2.5-flash"
 
 
-def fetch_news(company, query_suffix):
-    query = quote(f"{company} {query_suffix} when:2d")
-    url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
-    feed = feedparser.parse(url)
-    items = []
-    for entry in feed.entries[:5]:
-        items.append({"title": entry.title, "link": entry.link, "published": entry.get("published", "")})
-    return items
+def fetch_news_tavily(company, query_suffix):
+    """Fetch news from Tavily search API."""
+    query = f"{company} {query_suffix}"
+    url = "https://api.tavily.com/search"
+    
+    payload = {
+        "api_key": TAVILY_API_KEY,
+        "query": query,
+        "include_answer": False,
+        "max_results": 5,
+        "days": 2,
+        "include_domains": ["news.google.com", "techcrunch.com", "theverge.com", "reuters.com", "bloomberg.com", 
+                           "forbes.com", "zdnet.com", "arstechnica.com", "engadget.com", "venturebeat.com"]
+    }
+    
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        items = []
+        for result in data.get("results", [])[:5]:
+            items.append({
+                "title": result.get("title", ""),
+                "link": result.get("url", ""),
+                "snippet": result.get("content", "")
+            })
+        return items
+    except Exception as e:
+        print(f"    Tavily error: {e}")
+        return []
 
 
 def summarize(company, headlines, prompt_template):
-    """Ask Gemini to summarize. Fail fast on rate limits — only one retry."""
+    """Ask Gemini to summarize headlines. Fail gracefully on rate limits."""
     if not headlines:
         return "No recent news found.", []
 
-    headline_text = "\n".join([f"- {h['title']}" for h in headlines])
+    headline_text = "\n".join([
+        f"- {h['title']}\n  {h.get('snippet', '')[:200]}"
+        for h in headlines
+    ])
+    
     prompt = f"""{prompt_template.format(company=company)}
 
-Recent headlines:
+Recent news:
 {headline_text}
 
-Keep your response to 2-3 short sentences. Be direct and factual. Do not invent details that aren't in the headlines."""
+Keep your response to 2-3 short sentences. Be direct and factual."""
 
     for attempt in range(2):
         try:
-            response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+            response = genai_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
             return response.text.strip(), headlines
         except Exception as e:
             err = str(e)
             if ("429" in err or "RESOURCE_EXHAUSTED" in err) and attempt == 0:
-                print(f"    Rate limited, waiting 30s and retrying once...")
+                print(f"    Rate limited, waiting 30s and retrying...")
                 time.sleep(30)
                 continue
             if "429" in err or "RESOURCE_EXHAUSTED" in err:
                 return "(Daily quota reached — try again tomorrow.)", headlines
             return "(Summary unavailable — temporary error.)", headlines
+    
     return "(Summary unavailable.)", headlines
 
 
 def build_html(briefings, generated_at):
     today = generated_at.strftime("%A, %B %d, %Y")
     cards = ""
+    
     for company, tabs_data in briefings:
         tab_buttons = ""
         tab_panels = ""
         company_id = company.replace(" ", "-").lower()
+        
         for i, tab in enumerate(TABS):
             active_class = "active" if i == 0 else ""
             summary, headlines = tabs_data[tab["id"]]
+            
             tab_buttons += f"""<button class="tab-btn {active_class}" data-target="{company_id}-{tab['id']}"><span class="tab-icon">{tab['icon']}</span>{tab['label']}</button>"""
+            
             sources_html = ""
             if headlines:
-                links = "".join([f'<li><a href="{h["link"]}" target="_blank" rel="noopener">{h["title"]}</a></li>' for h in headlines[:3]])
+                links = "".join([
+                    f'<li><a href="{h["link"]}" target="_blank" rel="noopener">{h["title"]}</a></li>'
+                    for h in headlines[:3]
+                ])
                 sources_html = f'<details class="sources"><summary>Sources ({len(headlines)})</summary><ul>{links}</ul></details>'
+            
             tab_panels += f"""<div class="tab-panel {active_class}" id="{company_id}-{tab['id']}"><p class="summary">{summary}</p>{sources_html}</div>"""
+        
         cards += f"""<article class="card" data-company="{company.lower()}"><header class="card-head"><h2>{company}</h2></header><nav class="tabs">{tab_buttons}</nav><div class="tab-panels">{tab_panels}</div></article>"""
 
     html = f"""<!doctype html>
@@ -147,14 +187,14 @@ def build_html(briefings, generated_at):
   <div class="container">
     <header class="hero">
       <h1>📰 Tech News Briefing</h1>
-      <p>{today} · 13 companies · auto-summarized by Gemini · 3 lenses per company</p>
+      <p>{today} · 13 companies · summarized by Gemini · sourced by Tavily · 3 lenses per company</p>
     </header>
     <div class="filter-bar">
       <span style="font-size:14px">🔎</span>
       <input type="text" id="search" placeholder="Filter companies (e.g. Microsoft, AWS)…" />
     </div>
     <main class="grid" id="grid">{cards}</main>
-    <footer>Auto-updated daily by GitHub Actions · Sources: Google News RSS · Generated <code>{generated_at.strftime('%Y-%m-%d %H:%M UTC')}</code></footer>
+    <footer>Auto-updated daily by GitHub Actions · News sourced by Tavily API · Summaries by Gemini · Generated <code>{generated_at.strftime('%Y-%m-%d %H:%M UTC')}</code></footer>
   </div>
 <script>
   document.querySelectorAll('.card').forEach(card => {{
@@ -186,16 +226,20 @@ def build_html(briefings, generated_at):
 def main():
     generated_at = datetime.now(timezone.utc)
     briefings = []
+    
     for company in COMPANIES:
         print(f"\n=== {company} ===")
         tabs_data = {}
+        
         for tab in TABS:
             print(f"  Tab: {tab['label']}...")
-            headlines = fetch_news(company, tab["query_suffix"])
+            headlines = fetch_news_tavily(company, tab["query_suffix"])
             summary, sources = summarize(company, headlines, tab["prompt"])
             tabs_data[tab["id"]] = (summary, sources)
             time.sleep(15)
+        
         briefings.append((company, tabs_data))
+    
     html = build_html(briefings, generated_at)
     with open("index.html", "w", encoding="utf-8") as f:
         f.write(html)
